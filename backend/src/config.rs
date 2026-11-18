@@ -69,6 +69,14 @@ const DEFAULT_RPC_PRIORITY_CLASSES: &str = "transaction,indexer,health";
 /// configured `PREDIFI_STELLAR_RPC_URL` only".
 const DEFAULT_RPC_PROVIDER_FALLBACK_ORDER: &str = "";
 
+// ── Notification provider credentials (issue #355) ───────────────────────────
+/// Default notification provider endpoint. Empty means "no provider configured".
+const DEFAULT_NOTIFICATION_PROVIDER_URL: &str = "";
+/// Whether dual-key (previous + current) notification credentials may be used
+/// during a rotation (default `false`). Read from
+/// `PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED`.
+const DEFAULT_NOTIFICATION_DUAL_KEY_ENABLED: bool = false;
+
 /// Origins allowed by default when `CORS_ALLOWED_ORIGINS` is not set.
 pub const DEFAULT_CORS_ORIGINS: &[&str] = &[
     "http://localhost:3000",
@@ -246,6 +254,25 @@ pub struct Config {
     /// Policy applied when providers disagree (default `"quorum"`). One of
     /// `quorum`, `first`, `strict`. Read from `PREDIFI_RPC_DISAGREEMENT_POLICY`.
     pub rpc_disagreement_policy: String,
+
+    // ── Notification provider credentials (issue #355) ───────────────────────
+    /// Base URL of the notification provider (default empty → no provider).
+    /// Read from `PREDIFI_NOTIFICATION_PROVIDER_URL`.
+    pub notification_provider_url: String,
+    /// Current (active) notification provider credential. Read from
+    /// `PREDIFI_NOTIFICATION_PROVIDER_KEY`. Must be non-empty whenever a
+    /// provider URL is configured; a revoked/empty key is rejected at startup.
+    pub notification_provider_key: String,
+    /// Optional previous notification provider credential, retained only while
+    /// a dual-key rotation is in flight. Read from
+    /// `PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY`. Only honoured when
+    /// [`Self::notification_dual_key_enabled`] is `true`.
+    pub notification_provider_previous_key: Option<String>,
+    /// Whether dual-key transition is permitted (default `false`). Read from
+    /// `PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED`. Must be explicitly enabled for
+    /// a previous key to be accepted; providers without dual-key semantics
+    /// must leave this disabled.
+    pub notification_dual_key_enabled: bool,
 }
 
 impl Config {
@@ -429,6 +456,24 @@ impl Config {
             DEFAULT_RPC_DISAGREEMENT_POLICY,
         );
 
+        // ── Notification provider credentials (issue #355) ───────────────────
+        let notification_provider_url = get_string(
+            vars,
+            "PREDIFI_NOTIFICATION_PROVIDER_URL",
+            DEFAULT_NOTIFICATION_PROVIDER_URL,
+        );
+        let notification_provider_key =
+            get_string(vars, "PREDIFI_NOTIFICATION_PROVIDER_KEY", "");
+        let notification_provider_previous_key = vars
+            .get("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let notification_dual_key_enabled = get_bool(
+            vars,
+            "PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED",
+            DEFAULT_NOTIFICATION_DUAL_KEY_ENABLED,
+        )?;
+
         if db_min_connections > db_max_connections {
             return Err(ConfigError::InvalidValue {
                 key: "PREDIFI_DB_MIN_CONNECTIONS",
@@ -482,6 +527,10 @@ impl Config {
             rpc_provider_unhealthy_threshold,
             rpc_provider_healthy_threshold,
             rpc_disagreement_policy,
+            notification_provider_url,
+            notification_provider_key,
+            notification_provider_previous_key,
+            notification_dual_key_enabled,
         };
 
         config.validate()?;
@@ -812,6 +861,56 @@ impl Config {
             });
         }
 
+        // ── Notification provider credentials (issue #355) ───────────────────
+        let provider_url = self.notification_provider_url.trim();
+        if !provider_url.is_empty() {
+            validate_url_scheme(
+                provider_url,
+                "PREDIFI_NOTIFICATION_PROVIDER_URL",
+                &["http://", "https://"],
+            )?;
+            validate_url_has_host(provider_url, "PREDIFI_NOTIFICATION_PROVIDER_URL")?;
+        }
+
+        // A configured provider must always have a live credential. An empty
+        // key means the credential was revoked (or never provisioned) and must
+        // fail fast rather than silently dropping notifications.
+        if !provider_url.is_empty() && self.notification_provider_key.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_KEY",
+                reason: String::from(
+                    "must be set to a non-empty credential when \
+                     PREDIFI_NOTIFICATION_PROVIDER_URL is configured; \
+                     a revoked or empty key is rejected",
+                ),
+            });
+        }
+
+        // Dual-key transition is opt-in only. A previous key without explicit
+        // opt-in is a misconfiguration (the provider may not support it).
+        if self.notification_provider_previous_key.is_some() && !self.notification_dual_key_enabled {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
+                reason: String::from(
+                    "a previous credential requires PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED=true; \
+                     dual-key transition must be explicitly allowed",
+                ),
+            });
+        }
+
+        // The previous key must differ from the current key — otherwise the
+        // rotation has not actually happened.
+        if let Some(previous) = &self.notification_provider_previous_key {
+            if previous.trim() == self.notification_provider_key.trim() {
+                return Err(ConfigError::InvalidValue {
+                    key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
+                    reason: String::from(
+                        "must differ from PREDIFI_NOTIFICATION_PROVIDER_KEY during a rotation",
+                    ),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -879,6 +978,10 @@ impl Config {
             rpc_provider_unhealthy_threshold: DEFAULT_RPC_PROVIDER_UNHEALTHY_THRESHOLD,
             rpc_provider_healthy_threshold: DEFAULT_RPC_PROVIDER_HEALTHY_THRESHOLD,
             rpc_disagreement_policy: String::from(DEFAULT_RPC_DISAGREEMENT_POLICY),
+            notification_provider_url: String::from(DEFAULT_NOTIFICATION_PROVIDER_URL),
+            notification_provider_key: String::new(),
+            notification_provider_previous_key: None,
+            notification_dual_key_enabled: DEFAULT_NOTIFICATION_DUAL_KEY_ENABLED,
         }
     }
 }
@@ -2815,5 +2918,231 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ── Notification provider credentials (issue #355) ───────────────────────
+
+    #[test]
+    fn notification_provider_defaults_when_env_absent() {
+        let vars = HashMap::new();
+        let config = Config::from_map(&vars).unwrap();
+        assert_eq!(config.notification_provider_url, "");
+        assert_eq!(config.notification_provider_key, "");
+        assert!(config.notification_provider_previous_key.is_none());
+        assert!(!config.notification_dual_key_enabled);
+    }
+
+    #[test]
+    fn notification_provider_reads_from_env() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("https://notify.example.com"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("new-key"),
+            ),
+        ]);
+        let config = Config::from_map(&vars).unwrap();
+        assert_eq!(config.notification_provider_url, "https://notify.example.com");
+        assert_eq!(config.notification_provider_key, "new-key");
+        assert!(config.notification_provider_previous_key.is_none());
+        assert!(!config.notification_dual_key_enabled);
+    }
+
+    #[test]
+    fn notification_provider_rejects_empty_key_when_url_configured() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+            String::from("https://notify.example.com"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_KEY",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn notification_provider_rejects_whitespace_key_when_url_configured() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("https://notify.example.com"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("   "),
+            ),
+        ]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_KEY",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn notification_provider_rejects_invalid_url_scheme() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("ftp://notify.example.com"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("new-key"),
+            ),
+        ]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_URL",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn notification_provider_rejects_url_without_host() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("https:///notify"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("new-key"),
+            ),
+        ]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_URL",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn notification_provider_previous_key_requires_dual_key_opt_in() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("https://notify.example.com"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("new-key"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
+                String::from("old-key"),
+            ),
+        ]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn notification_provider_accepts_dual_key_when_enabled() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("https://notify.example.com"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("new-key"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
+                String::from("old-key"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED"),
+                String::from("true"),
+            ),
+        ]);
+        let config = Config::from_map(&vars).unwrap();
+        assert!(config.notification_dual_key_enabled);
+        assert_eq!(
+            config.notification_provider_previous_key.as_deref(),
+            Some("old-key")
+        );
+    }
+
+    #[test]
+    fn notification_provider_rejects_previous_key_equal_to_current() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("https://notify.example.com"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("same-key"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
+                String::from("same-key"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED"),
+                String::from("true"),
+            ),
+        ]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn notification_provider_rejects_non_boolean_dual_key_flag() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED"),
+            String::from("maybe"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn notification_provider_ignores_blank_previous_key() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("https://notify.example.com"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("new-key"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
+                String::from("   "),
+            ),
+        ]);
+        let config = Config::from_map(&vars).unwrap();
+        assert!(config.notification_provider_previous_key.is_none());
     }
 }

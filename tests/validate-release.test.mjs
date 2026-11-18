@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateRelease } from '../scripts/validate-release.mjs';
+import { checkHandbookLinks } from '../scripts/check-handbook-links.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -69,5 +70,44 @@ describe('Release metadata and build provenance validation', () => {
       () => validateRelease(invalid),
       /unsupported client version/
     );
+  });
+});
+
+describe('Maintainer handbook link check', () => {
+  it('passes when all handbook and runbook references resolve', () => {
+    const result = checkHandbookLinks({ root: ROOT });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.errors, []);
+    assert.ok(result.checked.length > 0, 'expected at least one reference to be checked');
+  });
+
+  it('fails with a clear error when a handbook reference is broken', () => {
+    const result = checkHandbookLinks({
+      root: ROOT,
+      overrides: {
+        'docs/handbook/maintainer-handbook.md': [
+          { target: 'docs/handbook/does-not-exist.md', source: 'docs/handbook/maintainer-handbook.md' },
+        ],
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.errors.length, 1);
+    assert.match(result.errors[0], /docs\/handbook\/does-not-exist\.md/);
+    assert.match(result.errors[0], /maintainer-handbook\.md/);
+  });
+
+  it('fails with a clear error when a runbook reference is broken', () => {
+    const result = checkHandbookLinks({
+      root: ROOT,
+      overrides: {
+        'docs/handbook/incident-runbook.md': [
+          { target: 'docs/handbook/missing-runbook.md', source: 'docs/handbook/incident-runbook.md' },
+        ],
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.errors.length, 1);
+    assert.match(result.errors[0], /docs\/handbook\/missing-runbook\.md/);
+    assert.match(result.errors[0], /incident-runbook\.md/);
   });
 });
