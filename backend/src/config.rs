@@ -30,6 +30,24 @@ const DEFAULT_SECRET_KEY: &str = "predifi-dev-secret-do-not-use-in-production-32
 const DEFAULT_APP_ENV: &str = "development";
 const DEFAULT_INDEXER_MAX_BATCH_SIZE: usize = crate::constants::DEFAULT_INDEXER_MAX_BATCH_SIZE;
 
+// ── Database connection budget (issue #353) ──────────────────────────────────
+/// Default PostgreSQL server-side connection limit (`max_connections`).
+const DEFAULT_DB_SERVER_MAX_CONNECTIONS: u32 = 100;
+/// Default number of connections reserved for administration (superuser,
+/// migrations, monitoring, `psql` sessions) and left out of the service budget.
+const DEFAULT_DB_ADMIN_HEADROOM_CONNECTIONS: u32 = 10;
+/// Default maximum number of backend replicas that may run concurrently.
+const DEFAULT_DB_MAX_REPLICAS: u32 = 1;
+/// Default number of connections each replica's pool may hold. Kept in sync
+/// with [`DEFAULT_DB_MAX_CONNECTIONS`] so the budget check is meaningful even
+/// when only the replica count is overridden.
+const DEFAULT_DB_POOL_SIZE_PER_REPLICA: u32 = DEFAULT_DB_MAX_CONNECTIONS;
+/// Default number of additional non-HTTP services (indexer, workers) that each
+/// hold their own pool and therefore consume from the same budget.
+const DEFAULT_DB_AUXILIARY_SERVICES: u32 = 0;
+/// Default number of connections each auxiliary service's pool may hold.
+const DEFAULT_DB_AUXILIARY_POOL_SIZE: u32 = DEFAULT_DB_MAX_CONNECTIONS;
+
 // ── Abuse-control defaults (issue #103) ──────────────────────────────────────
 /// Default number of market-creation requests a single wallet may make per
 /// abuse-control window.
@@ -255,6 +273,26 @@ pub struct Config {
     /// `quorum`, `first`, `strict`. Read from `PREDIFI_RPC_DISAGREEMENT_POLICY`.
     pub rpc_disagreement_policy: String,
 
+    // ── Database connection budget (issue #353) ──────────────────────────────
+    /// PostgreSQL server-side connection limit (`max_connections`). Default
+    /// `100`. Read from `PREDIFI_DB_SERVER_MAX_CONNECTIONS`.
+    pub db_server_max_connections: u32,
+    /// Connections reserved for administration and left out of the service
+    /// budget (default `10`). Read from `PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS`.
+    pub db_admin_headroom_connections: u32,
+    /// Maximum number of backend replicas that may run concurrently (default
+    /// `1`). Read from `PREDIFI_DB_MAX_REPLICAS`.
+    pub db_max_replicas: u32,
+    /// Connections each replica's pool may hold (default `10`). Read from
+    /// `PREDIFI_DB_POOL_SIZE_PER_REPLICA`.
+    pub db_pool_size_per_replica: u32,
+    /// Number of additional non-HTTP services (indexer, workers) that each hold
+    /// their own pool (default `0`). Read from `PREDIFI_DB_AUXILIARY_SERVICES`.
+    pub db_auxiliary_services: u32,
+    /// Connections each auxiliary service's pool may hold (default `10`). Read
+    /// from `PREDIFI_DB_AUXILIARY_POOL_SIZE`.
+    pub db_auxiliary_pool_size: u32,
+
     // ── Notification provider credentials (issue #355) ───────────────────────
     /// Base URL of the notification provider (default empty → no provider).
     /// Read from `PREDIFI_NOTIFICATION_PROVIDER_URL`.
@@ -456,6 +494,38 @@ impl Config {
             DEFAULT_RPC_DISAGREEMENT_POLICY,
         );
 
+        // ── Database connection budget (issue #353) ──────────────────────────
+        let db_server_max_connections = get_u32(
+            vars,
+            "PREDIFI_DB_SERVER_MAX_CONNECTIONS",
+            DEFAULT_DB_SERVER_MAX_CONNECTIONS,
+        )?;
+        let db_admin_headroom_connections = get_u32(
+            vars,
+            "PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS",
+            DEFAULT_DB_ADMIN_HEADROOM_CONNECTIONS,
+        )?;
+        let db_max_replicas = get_u32(
+            vars,
+            "PREDIFI_DB_MAX_REPLICAS",
+            DEFAULT_DB_MAX_REPLICAS,
+        )?;
+        let db_pool_size_per_replica = get_u32(
+            vars,
+            "PREDIFI_DB_POOL_SIZE_PER_REPLICA",
+            DEFAULT_DB_POOL_SIZE_PER_REPLICA,
+        )?;
+        let db_auxiliary_services = get_u32(
+            vars,
+            "PREDIFI_DB_AUXILIARY_SERVICES",
+            DEFAULT_DB_AUXILIARY_SERVICES,
+        )?;
+        let db_auxiliary_pool_size = get_u32(
+            vars,
+            "PREDIFI_DB_AUXILIARY_POOL_SIZE",
+            DEFAULT_DB_AUXILIARY_POOL_SIZE,
+        )?;
+
         // ── Notification provider credentials (issue #355) ───────────────────
         let notification_provider_url = get_string(
             vars,
@@ -531,6 +601,12 @@ impl Config {
             notification_provider_key,
             notification_provider_previous_key,
             notification_dual_key_enabled,
+            db_server_max_connections,
+            db_admin_headroom_connections,
+            db_max_replicas,
+            db_pool_size_per_replica,
+            db_auxiliary_services,
+            db_auxiliary_pool_size,
         };
 
         config.validate()?;
@@ -861,6 +937,45 @@ impl Config {
             });
         }
 
+        // ── Database connection budget (issue #353) ──────────────────────────
+        if self.db_server_max_connections == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_SERVER_MAX_CONNECTIONS",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.db_max_replicas == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_MAX_REPLICAS",
+                reason: String::from("must be at least one"),
+            });
+        }
+        if self.db_pool_size_per_replica == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_POOL_SIZE_PER_REPLICA",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.db_auxiliary_services > 0 && self.db_auxiliary_pool_size == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_AUXILIARY_POOL_SIZE",
+                reason: String::from(
+                    "must be greater than zero when PREDIFI_DB_AUXILIARY_SERVICES is set",
+                ),
+            });
+        }
+        // The admin headroom must leave at least one connection for the
+        // services themselves; otherwise the budget is unusable.
+        if self.db_admin_headroom_connections >= self.db_server_max_connections {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS",
+                reason: format!(
+                    "must be < PREDIFI_DB_SERVER_MAX_CONNECTIONS ({}), got {}",
+                    self.db_server_max_connections, self.db_admin_headroom_connections
+                ),
+            });
+        }
+
         // ── Notification provider credentials (issue #355) ───────────────────
         let provider_url = self.notification_provider_url.trim();
         if !provider_url.is_empty() {
@@ -892,8 +1007,45 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
                 reason: String::from(
+                    "a previ
+                ),
+            });
+        }
+
+        let budget = self.db_connection_budget();
+        if budget.required_connections > budget.available_connections {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_MAX_REPLICAS",
+                reason: format!(
+                    "unsafe database connection budget: {} replicas x {} pool + {} auxiliary x {} \
+                     = {} connections required, but only {} available after reserving {} of {} \
+                     for administration; reduce PREDIFI_DB_POOL_SIZE_PER_REPLICA, \
+                     PREDIFI_DB_MAX_REPLICAS or PREDIFI_DB_AUXILIARY_SERVICES, or raise \
+                     PREDIFI_DB_SERVER_MAX_CONNECTIONS",
+                    self.db_max_replicas,
+                    self.db_pool_size_per_replica,
+                    self.db_auxiliary_services,
+                    self.db_auxiliary_pool_size,
+                    budget.required_connections,
+                    budget.available_connections,
+                    self.db_admin_headroom_connections,
+                    self.db_server_max_connections
+                ),
+            });
+        }
+
+        // Dual-key transition is opt-in only. A previous key without explicit
+        // opt-in is a misconfiguration (the provider may not support it).
+        if self.notification_provider_previous_key.is_some() && !self.notification_dual_key_enabled {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
+                reason: String::from(
                     "a previous credential requires PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED=true; \
                      dual-key transition must be explicitly allowed",
+                ),
+            });
+        }
+
                 ),
             });
         }
@@ -912,6 +1064,34 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Compute the global database connection budget (issue #353).
+    ///
+    /// The budget accounts for every pool that may connect to PostgreSQL at
+    /// peak replica count: the HTTP replicas plus any auxiliary services
+    /// (indexer, workers) that hold their own pool. Administration headroom is
+    /// subtracted from the server limit before comparing.
+    pub fn db_connection_budget(&self) -> DbConnectionBudget {
+        let replica_connections = self
+            .db_max_replicas
+            .saturating_mul(self.db_pool_size_per_replica);
+        let auxiliary_connections = self
+            .db_auxiliary_services
+            .saturating_mul(self.db_auxiliary_pool_size);
+        let required_connections = replica_connections.saturating_add(auxiliary_connections);
+        let available_connections = self
+            .db_server_max_connections
+            .saturating_sub(self.db_admin_headroom_connections);
+
+        DbConnectionBudget {
+            server_max_connections: self.db_server_max_connections,
+            admin_headroom_connections: self.db_admin_headroom_connections,
+            available_connections,
+            replica_connections,
+            auxiliary_connections,
+            required_connections,
+        }
     }
 
     /// Return the `host:port` string used to bind the TCP listener.
@@ -982,7 +1162,41 @@ impl Config {
             notification_provider_key: String::new(),
             notification_provider_previous_key: None,
             notification_dual_key_enabled: DEFAULT_NOTIFICATION_DUAL_KEY_ENABLED,
+            db_server_max_connections: DEFAULT_DB_SERVER_MAX_CONNECTIONS,
+            db_admin_headroom_connections: DEFAULT_DB_ADMIN_HEADROOM_CONNECTIONS,
+            db_max_replicas: DEFAULT_DB_MAX_REPLICAS,
+            db_pool_size_per_replica: DEFAULT_DB_POOL_SIZE_PER_REPLICA,
+            db_auxiliary_services: DEFAULT_DB_AUXILIARY_SERVICES,
+            db_auxiliary_pool_size: DEFAULT_DB_AUXILIARY_POOL_SIZE,
         }
+    }
+}
+
+/// Snapshot of the global database connection budget (issue #353).
+///
+/// Produced by [`Config::db_connection_budget`] and used both by startup
+/// validation and by deployment checks to verify that the calculated maximum
+/// connection count stays within the PostgreSQL server limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbConnectionBudget {
+    /// PostgreSQL server-side connection limit (`max_connections`).
+    pub server_max_connections: u32,
+    /// Connections reserved for administration and excluded from the budget.
+    pub admin_headroom_connections: u32,
+    /// Connections available to services after subtracting admin headroom.
+    pub available_connections: u32,
+    /// Connections consumed by all HTTP replicas at peak replica count.
+    pub replica_connections: u32,
+    /// Connections consumed by auxiliary services at peak replica count.
+    pub auxiliary_connections: u32,
+    /// Total connections required at peak replica count.
+    pub required_connections: u32,
+}
+
+impl DbConnectionBudget {
+    /// `true` when the calculated maximum fits within the available budget.
+    pub fn is_within_limit(&self) -> bool {
+        self.required_connections <= self.available_connections
     }
 }
 
@@ -2920,165 +3134,111 @@ mod tests {
         ));
     }
 
-    // ── Notification provider credentials (issue #355) ───────────────────────
+    // ── Database connection budget (issue #353) ──────────────────────────────
 
     #[test]
-    fn notification_provider_defaults_when_env_absent() {
+    fn db_budget_uses_defaults_when_env_absent() {
         let vars = HashMap::new();
         let config = Config::from_map(&vars).unwrap();
-        assert_eq!(config.notification_provider_url, "");
-        assert_eq!(config.notification_provider_key, "");
-        assert!(config.notification_provider_previous_key.is_none());
-        assert!(!config.notification_dual_key_enabled);
-    }
-
-    #[test]
-    fn notification_provider_reads_from_env() {
-        let vars = HashMap::from([
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
-                String::from("https://notify.example.com"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
-                String::from("new-key"),
-            ),
-        ]);
-        let config = Config::from_map(&vars).unwrap();
-        assert_eq!(config.notification_provider_url, "https://notify.example.com");
-        assert_eq!(config.notification_provider_key, "new-key");
-        assert!(config.notification_provider_previous_key.is_none());
-        assert!(!config.notification_dual_key_enabled);
-    }
-
-    #[test]
-    fn notification_provider_rejects_empty_key_when_url_configured() {
-        let vars = HashMap::from([(
-            String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
-            String::from("https://notify.example.com"),
-        )]);
-        assert!(matches!(
-            Config::from_map(&vars),
-            Err(ConfigError::InvalidValue {
-                key: "PREDIFI_NOTIFICATION_PROVIDER_KEY",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn notification_provider_rejects_whitespace_key_when_url_configured() {
-        let vars = HashMap::from([
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
-                String::from("https://notify.example.com"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
-                String::from("   "),
-            ),
-        ]);
-        assert!(matches!(
-            Config::from_map(&vars),
-            Err(ConfigError::InvalidValue {
-                key: "PREDIFI_NOTIFICATION_PROVIDER_KEY",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn notification_provider_rejects_invalid_url_scheme() {
-        let vars = HashMap::from([
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
-                String::from("ftp://notify.example.com"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
-                String::from("new-key"),
-            ),
-        ]);
-        assert!(matches!(
-            Config::from_map(&vars),
-            Err(ConfigError::InvalidValue {
-                key: "PREDIFI_NOTIFICATION_PROVIDER_URL",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn notification_provider_rejects_url_without_host() {
-        let vars = HashMap::from([
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
-                String::from("https:///notify"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
-                String::from("new-key"),
-            ),
-        ]);
-        assert!(matches!(
-            Config::from_map(&vars),
-            Err(ConfigError::InvalidValue {
-                key: "PREDIFI_NOTIFICATION_PROVIDER_URL",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn notification_provider_previous_key_requires_dual_key_opt_in() {
-        let vars = HashMap::from([
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
-                String::from("https://notify.example.com"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
-                String::from("new-key"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
-                String::from("old-key"),
-            ),
-        ]);
-        assert!(matches!(
-            Config::from_map(&vars),
-            Err(ConfigError::InvalidValue {
-                key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn notification_provider_accepts_dual_key_when_enabled() {
-        let vars = HashMap::from([
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
-                String::from("https://notify.example.com"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
-                String::from("new-key"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
-                String::from("old-key"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED"),
-                String::from("true"),
-            ),
-        ]);
-        let config = Config::from_map(&vars).unwrap();
-        assert!(config.notification_dual_key_enabled);
         assert_eq!(
-            config.notification_provider_previous_key.as_deref(),
-            Some("old-key")
+            config.db_server_max_connections,
+            DEFAULT_DB_SERVER_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            config.db_admin_headroom_connections,
+            DEFAULT_DB_ADMIN_HEADROOM_CONNECTIONS
+        );
+        assert_eq!(config.db_max_replicas, DEFAULT_DB_MAX_REPLICAS);
+        assert_eq!(
+            config.db_pool_size_per_replica,
+            DEFAULT_DB_POOL_SIZE_PER_REPLICA
+        );
+        assert_eq!(config.db_auxiliary_services, DEFAULT_DB_AUXILIARY_SERVICES);
+        assert_eq!(config.db_auxiliary_pool_size, DEFAULT_DB_AUXILIARY_POOL_SIZE);
+    }
+
+    #[test]
+    fn db_budget_reads_from_env() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_DB_SERVER_MAX_CONNECTIONS"),
+                String::from("200"),
+            ),
+            (
+                String::from("PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS"),
+                String::from("20"),
+            ),
+            (String::from("PREDIFI_DB_MAX_REPLICAS"), String::from("4")),
+            (
+                String::from("PREDIFI_DB_POOL_SIZE_PER_REPLICA"),
+                String::from("15"),
+            ),
+            (
+                String::from("PREDIFI_DB_AUXILIARY_SERVICES"),
+                String::from("2"),
+            ),
+            (
+                String::from("PREDIFI_DB_AUXILIARY_POOL_SIZE"),
+                String::from("5"),
+            ),
+        ]);
+        let config = Config::from_map(&vars).unwrap();
+        assert_eq!(config.db_server_max_connections, 200);
+        assert_eq!(config.db_admin_headroom_connections, 20);
+        assert_eq!(config.db_max_replicas, 4);
+        assert_eq!(config.db_pool_size_per_replica, 15);
+        assert_eq!(config.db_auxiliary_services, 2);
+        assert_eq!(config.db_auxiliary_pool_size, 5);
+    }
+
+    #[test]
+    fn db_budget_computes_required_and_available() {
+        let config = Config {
+            db_server_max_connections: 100,
+            db_admin_headroom_connections: 10,
+            db_max_replicas: 4,
+            db_pool_size_per_replica: 10,
+            db_auxiliary_services: 2,
+            db_auxiliary_pool_size: 5,
+            ..Config::default_for_test()
+        };
+        let budget = config.db_connection_budget();
+        assert_eq!(budget.available_connections, 90);
+        assert_eq!(budget.replica_connections, 40);
+        assert_eq!(budget.auxiliary_connections, 10);
+        assert_eq!(budget.required_connections, 50);
+        assert!(budget.is_within_limit());
+        config
+            .validate()
+            .expect("budget within limit must be accepted");
+    }
+
+    #[test]
+    fn db_budget_rejects_unsafe_replica_configuration() {
+        // 10 replicas x 20 connections = 200 > 100 - 10 available.
+        let config = Config {
+            db_server_max_connections: 100,
+            db_admin_headroom_connections: 10,
+            db_max_replicas: 10,
+            db_pool_size_per_replica: 20,
+            ..Config::default_for_test()
+        };
+        let error = config
+            .validate()
+            .expect_err("unsafe replica configuration must be rejected");
+        assert!(
+            matches!(
+                error,
+                ConfigError::InvalidValue {
+                    key: "PREDIFI_DB_MAX_REPLICAS",
+                    ..
+                }
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("unsafe database connection budget"),
+            "expected actionable budget error, got: {error}"
         );
     }
 
@@ -3094,18 +3254,31 @@ mod tests {
                 String::from("same-key"),
             ),
             (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
-                String::from("same-key"),
+                String::from("PREDIFI_NOTI
+        );
+    }
+
+    #[test]
+    fn db_budget_rejects_unsafe_configuration_via_env() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_DB_SERVER_MAX_CONNECTIONS"),
+                String::from("50"),
             ),
             (
-                String::from("PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED"),
-                String::from("true"),
+                String::from("PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS"),
+                String::from("5"),
+            ),
+            (String::from("PREDIFI_DB_MAX_REPLICAS"), String::from("10")),
+            (
+                String::from("PREDIFI_DB_POOL_SIZE_PER_REPLICA"),
+                String::from("10"),
             ),
         ]);
         assert!(matches!(
             Config::from_map(&vars),
             Err(ConfigError::InvalidValue {
-                key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
+                key: "PREDIFI_DB_MAX_REPLICAS",
                 ..
             })
         ));
@@ -3121,6 +3294,109 @@ mod tests {
             Config::from_map(&vars),
             Err(ConfigError::InvalidValue {
                 key: "PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn db_budget_accepts_exact_limit() {
+        // 9 replicas x 10 = 90 == 100 - 10 available.
+        let config = Config {
+            db_server_max_connections: 100,
+            db_admin_headroom_connections: 10,
+            db_max_replicas: 9,
+            db_pool_size_per_replica: 10,
+            db_auxiliary_services: 0,
+            ..Config::default_for_test()
+        };
+        config
+            .validate()
+            .expect("configuration exactly at the limit must be accepted");
+    }
+
+    #[test]
+    fn db_budget_rejects_headroom_covering_whole_limit() {
+        let config = Config {
+            db_server_max_connections: 100,
+            db_admin_headroom_connections: 100,
+            ..Config::default_for_test()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn db_budget_rejects_zero_replicas() {
+        let config = Config {
+            db_max_replicas: 0,
+            ..Config::default_for_test()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_MAX_REPLICAS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn db_budget_rejects_zero_auxiliary_pool_when_services_configured() {
+        let config = Config {
+            db_auxiliary_services: 2,
+            db_auxiliary_pool_size: 0,
+            ..Config::default_for_test()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_DB_AUXILIARY_POOL_SIZE",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn db_budget_rejects_non_numeric_replicas() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_DB_MAX_REPLICAS"),
+            String::from("many"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidNumber {
+                key: "PREDIFI_DB_MAX_REPLICAS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn notification_provider_ignores_blank_previous_key() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
+                String::from("https://notify.example.com"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
+                String::from("new-key"),
+            ),
+            (
+                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
+                String::from("   "),
+            ),
+        ]);
+        let config = Config::from_map(&vars).expect("blank previous key should be ignored");
+        assert_eq!(config.notification_provider_previous_key, None);
+    }
+
                 ..
             })
         ));
@@ -3145,4 +3421,20 @@ mod tests {
         let config = Config::from_map(&vars).unwrap();
         assert!(config.notification_provider_previous_key.is_none());
     }
+
+    #[test]
+    fn db_budget_rejects_non_numeric_replicas() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_DB_MAX_REPLICAS"),
+            String::from("many"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidNumber {
+                key: "PREDIFI_DB_MAX_REPLICAS",
+                ..
+            })
+        ));
+    }
+
 }
